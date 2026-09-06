@@ -19,6 +19,7 @@ Item {
   property string receiveMode: "ask"
   property bool receiving: false
   property string saveDir: ""
+  property real askTimeout: 60
   property string daemonError: ""
   property var devices: []
   property var transfers: []
@@ -49,6 +50,7 @@ Item {
       receiveMode = String(state.receiveMode || "ask")
       receiving = state.receiving === true
       saveDir = String(state.saveDir || "")
+      askTimeout = Number(state.askTimeout || 60)
       daemonError = String(state.error || "")
       devices = state.devices || []
       transfers = state.transfers || []
@@ -76,6 +78,7 @@ Item {
   function setMode(mode) { enqueue(["mode", mode]) }
   function toggleReceiving() { setMode(receiveMode === "off" ? "ask" : "off") }
   function announce() { enqueue(["announce"]) }
+  function cancelTransfer(id) { enqueue(["cancel", String(id || "")]) }
   function clearTransfers() { enqueue(["clear"]) }
 
   function respond(accept) {

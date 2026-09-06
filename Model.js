@@ -16,6 +16,7 @@ var GLYPH = {
   receive: String.fromCodePoint(0xf01da),
   done: String.fromCodePoint(0xf012c),
   failed: String.fromCodePoint(0xf0156),
+  stop: String.fromCodePoint(0xf0156),
   refresh: String.fromCodePoint(0xf0450),
   folder: String.fromCodePoint(0xf0770)
 }
@@ -56,7 +57,9 @@ function deviceMeta(device) {
 function transferGlyph(transfer) {
   if (!transfer) return GLYPH.send
   if (transfer.status === "done") return GLYPH.done
-  if (transfer.status === "failed" || transfer.status === "declined") return GLYPH.failed
+  if (transfer.status === "failed" || transfer.status === "declined"
+      || transfer.status === "expired" || transfer.status === "cancelled")
+    return GLYPH.failed
   return transfer.direction === "receive" ? GLYPH.receive : GLYPH.send
 }
 
@@ -72,7 +75,9 @@ function transferMeta(transfer) {
   var peer = String(transfer.peer || "device")
   var direction = transfer.direction === "receive" ? "from " : "to "
   if (transfer.status === "failed") return String(transfer.error || "Failed") 
-  if (transfer.status === "declined") return "Declined by " + peer
+  if (transfer.status === "declined") return "Declined"
+  if (transfer.status === "expired") return "Expired — nobody answered in time"
+  if (transfer.status === "cancelled") return "Cancelled"
   if (transfer.status === "done")
     return formatBytes(transfer.total) + " " + direction + peer
   return formatBytes(transfer.bytes) + " of " + formatBytes(transfer.total) + " " + direction + peer
@@ -91,6 +96,12 @@ function incomingTitle(incoming) {
   var count = Number(incoming.fileCount || 1)
   return String(incoming.alias || "A device") + " wants to send "
     + count + (count === 1 ? " file" : " files")
+}
+
+function secondsLeft(incoming, timeout, now) {
+  if (!incoming) return 0
+  var deadline = Number(incoming.requested || 0) + Number(timeout || 60)
+  return Math.max(0, Math.round(deadline - now / 1000))
 }
 
 function incomingMeta(incoming) {

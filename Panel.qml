@@ -42,6 +42,16 @@ Panel {
   // -1 is the incoming card, 0..n-1 the device rows.
   property int cursorIndex: 0
   property bool cursorActive: false
+  // Ticks only while a request is on screen, to drive its countdown.
+  property real nowMs: 0
+
+  Timer {
+    interval: 500
+    repeat: true
+    running: root.opened && service.hasIncoming
+    triggeredOnStart: true
+    onTriggered: root.nowMs = Date.now()
+  }
 
   function deviceCount() { return (service.devices || []).length }
 
@@ -466,6 +476,18 @@ Panel {
         elide: Text.ElideRight
       }
 
+      Text {
+        textFormat: Text.PlainText
+        width: parent.width
+        // The request really does expire, and the sender gives up with it;
+        // saying so beats a card that silently disappears.
+        text: "Expires in " + Model.secondsLeft(service.incoming,
+                                                service.askTimeout, root.nowMs) + "s"
+        color: root.urgent
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+      }
+
       Row {
         spacing: Style.space(8)
 
@@ -614,7 +636,19 @@ Panel {
       anchors.rightMargin: Style.space(10)
       spacing: Style.space(10)
 
+      PanelActionButton {
+        visible: transferRow.transfer && transferRow.transfer.status === "active"
+        iconText: Model.GLYPH.stop
+        tooltipText: "Cancel"
+        foreground: root.urgent
+        fontFamily: root.fontFamily
+        fontSize: Style.font.iconSmall
+        Layout.alignment: Qt.AlignVCenter
+        onClicked: service.cancelTransfer(transferRow.transfer.id)
+      }
+
       Text {
+        visible: !(transferRow.transfer && transferRow.transfer.status === "active")
         textFormat: Text.PlainText
         text: Model.transferGlyph(transferRow.transfer)
         color: transferRow.transfer && (transferRow.transfer.status === "failed"

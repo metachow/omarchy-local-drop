@@ -7,6 +7,7 @@ Usage:
   local-drop-ctl send <fingerprint> <file> [file...]
   local-drop-ctl send-clipboard <fingerprint>
   local-drop-ctl accept [sessionId] | decline [sessionId]
+  local-drop-ctl cancel <transferId>
   local-drop-ctl mode <off|ask|auto>
   local-drop-ctl alias <name>
   local-drop-ctl announce | clear | quit
@@ -50,6 +51,10 @@ def build(argv):
         if not rest:
             raise SystemExit("usage: local-drop-ctl send-clipboard <fingerprint>")
         return {"cmd": "send-clipboard", "fingerprint": rest[0]}
+    if command == "cancel":
+        if not rest:
+            raise SystemExit("usage: local-drop-ctl cancel <transferId>")
+        return {"cmd": "cancel", "transfer": rest[0]}
     if command in ("accept", "decline"):
         return {"cmd": "respond", "accept": command == "accept",
                 "sessionId": rest[0] if rest else ""}
