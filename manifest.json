@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "id": "zhou-mi.local-drop",
+  "name": "LocalDrop",
+  "version": "1.0.0",
+  "author": "zhou-mi",
+  "license": "MIT",
+  "homepage": "https://github.com/metachow/omarchy-local-drop",
+  "repository": "https://github.com/metachow/omarchy-local-drop",
+  "description": "Find nearby LocalSend devices, send them files or the clipboard with a click, and approve incoming transfers from the bar.",
+  "keywords": [
+    "local-drop",
+    "localsend",
+    "share",
+    "files",
+    "transfer",
+    "nearby"
+  ],
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "LocalDrop",
+    "description": "Send files to nearby devices and accept incoming transfers.",
+    "category": "Files",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

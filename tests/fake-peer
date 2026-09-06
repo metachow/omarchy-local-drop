@@ -1,0 +1,180 @@
+#!/usr/bin/python3
+"""A stand-in LocalSend device, so LocalDrop can be tested without a second machine.
+
+    ./tests/fake-peer                        plain HTTP peer
+    ./tests/fake-peer --tls                  HTTPS with a self-signed certificate
+    ./tests/fake-peer --mtls                 HTTPS that demands a client certificate
+    ./tests/fake-peer --alias "Pixel 8"      name it something else
+
+It announces itself over multicast every few seconds — so it appears in the
+panel's device list — and writes whatever it is sent into `tests/inbox/`.
+
+`--mtls` is the one that matters: the LocalSend mobile apps ask for a client
+certificate during the handshake, and a client that does not present one is
+turned away with `TLSV13_ALERT_CERTIFICATE_REQUIRED`.
+"""
+
+import argparse
+import json
+import os
+import socket
+import ssl
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+
+MULTICAST_GROUP = "224.0.0.167"
+DISCOVERY_PORT = 53317
+OWN_CERT = os.path.expanduser("~/.config/omarchy/local-drop-cert.pem")
+
+files_offered = {}
+
+
+def certificate(directory):
+    """A throwaway self-signed certificate, generated once per run."""
+    crt = os.path.join(directory, "peer.crt")
+    key = os.path.join(directory, "peer.key")
+    if not (os.path.exists(crt) and os.path.exists(key)):
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+             "-days", "2", "-subj", "/CN=fake-localsend",
+             "-keyout", key, "-out", crt],
+            check=True, capture_output=True)
+    return crt, key
+
+
+def make_handler(inbox):
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *_args):
+            pass
+
+        def reply(self, code, payload=None):
+            body = b"" if payload is None else json.dumps(payload).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
+
+        def do_GET(self):
+            self.reply(200, {"alias": ARGS.alias, "version": "2.1",
+                             "deviceModel": "Test", "deviceType": "mobile",
+                             "fingerprint": ARGS.fingerprint, "port": ARGS.port,
+                             "protocol": ARGS.protocol, "download": False})
+
+        def do_POST(self):
+            route = urlparse(self.path)
+            query = parse_qs(route.query)
+            length = int(self.headers.get("Content-Length") or 0)
+
+            if route.path.endswith("register"):
+                self.rfile.read(length)
+                return self.do_GET()
+
+            if route.path.endswith("prepare-upload"):
+                body = json.loads(self.rfile.read(length))
+                files_offered.update(body["files"])
+                print("← prepare-upload: %s" % ", ".join(
+                    f["fileName"] for f in body["files"].values()), flush=True)
+                return self.reply(200, {
+                    "sessionId": "test-session",
+                    "files": {k: "token-" + k for k in body["files"]},
+                })
+
+            if route.path.endswith("upload"):
+                file_id = (query.get("fileId") or [""])[0]
+                if (query.get("token") or [""])[0] != "token-" + file_id:
+                    return self.reply(403, {"message": "bad token"})
+                name = os.path.basename(files_offered[file_id]["fileName"])
+                target = os.path.join(inbox, name)
+                written = 0
+                with open(target, "wb") as handle:
+                    while written < length:
+                        chunk = self.rfile.read(min(65536, length - written))
+                        if not chunk:
+                            break
+                        handle.write(chunk)
+                        written += len(chunk)
+                print("← received %s (%d bytes)" % (name, written), flush=True)
+                return self.reply(200, {})
+
+            self.reply(404, {"message": "not found"})
+
+    return Handler
+
+
+def announce_forever():
+    """Multicast our presence so the panel lists us."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
+    payload = json.dumps({
+        "alias": ARGS.alias, "version": "2.1", "deviceModel": "Test",
+        "deviceType": ARGS.device_type, "fingerprint": ARGS.fingerprint,
+        "port": ARGS.port, "protocol": ARGS.protocol,
+        "download": False, "announce": True,
+    }).encode("utf-8")
+    while True:
+        try:
+            sock.sendto(payload, (MULTICAST_GROUP, DISCOVERY_PORT))
+        except OSError as exc:
+            print("announce failed: %s" % exc, file=sys.stderr, flush=True)
+        time.sleep(4)
+
+
+def main():
+    global ARGS
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--tls", action="store_true", help="serve HTTPS")
+    parser.add_argument("--mtls", action="store_true",
+                        help="serve HTTPS and require a client certificate")
+    parser.add_argument("--alias", default="Fake peer")
+    parser.add_argument("--device-type", default="mobile")
+    parser.add_argument("--port", type=int, default=53399)
+    # Not inside the plugin directory: the shell watches that tree and reloads
+    # the plugin — restarting the daemon, losing its transfer list — every time
+    # a test file lands there.
+    parser.add_argument("--inbox", default=os.path.join(
+        os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "local-drop-test-inbox"))
+    ARGS = parser.parse_args()
+    ARGS.protocol = "https" if (ARGS.tls or ARGS.mtls) else "http"
+    ARGS.fingerprint = uuid.uuid5(uuid.NAMESPACE_DNS, ARGS.alias).hex * 2
+
+    os.makedirs(ARGS.inbox, exist_ok=True)
+    server = ThreadingHTTPServer(("0.0.0.0", ARGS.port), make_handler(ARGS.inbox))
+    server.daemon_threads = True
+
+    if ARGS.protocol == "https":
+        work = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"),
+                            "local-drop-test-peer")
+        os.makedirs(work, exist_ok=True)
+        crt, key = certificate(work)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(crt, key)
+        if ARGS.mtls:
+            if not os.path.exists(OWN_CERT):
+                sys.exit("--mtls needs %s; send something once so it is generated"
+                         % OWN_CERT)
+            context.verify_mode = ssl.CERT_REQUIRED
+            context.load_verify_locations(cafile=OWN_CERT)
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+
+    threading.Thread(target=announce_forever, daemon=True).start()
+    print("%s listening on %s://0.0.0.0:%d, inbox %s"
+          % (ARGS.alias, ARGS.protocol, ARGS.port, ARGS.inbox), flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

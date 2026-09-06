@@ -1,0 +1,86 @@
+#!/usr/bin/python3
+"""Push files at the running LocalDrop daemon, the way a phone would.
+
+    ./tests/send-to-us hello.txt              one file
+    ./tests/send-to-us --alias "Pixel 8" a b  named sender, two files
+
+With the receive mode on `Ask first` this parks a request in the panel and
+waits — up to a minute — for Accept or Decline, which is the point: it is the
+only way to exercise that path without a second device.
+"""
+
+import argparse
+import http.client
+import json
+import mimetypes
+import os
+import sys
+import uuid
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("files", nargs="+")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=53317)
+    parser.add_argument("--alias", default="Test sender")
+    args = parser.parse_args()
+
+    paths = [os.path.abspath(p) for p in args.files]
+    for path in paths:
+        if not os.path.isfile(path):
+            sys.exit("not a file: %s" % path)
+
+    offered = {}
+    for path in paths:
+        file_id = uuid.uuid4().hex
+        offered[file_id] = {
+            "id": file_id,
+            "fileName": os.path.basename(path),
+            "size": os.path.getsize(path),
+            "fileType": mimetypes.guess_type(path)[0] or "application/octet-stream",
+            "sha256": None,
+            "preview": None,
+        }
+
+    info = {"alias": args.alias, "version": "2.1", "deviceModel": "Test",
+            "deviceType": "mobile", "fingerprint": uuid.uuid4().hex * 2,
+            "port": 53399, "protocol": "http", "download": False}
+
+    conn = http.client.HTTPConnection(args.host, args.port, timeout=120)
+    conn.request("POST", "/api/localsend/v2/prepare-upload",
+                 body=json.dumps({"info": info, "files": offered}).encode("utf-8"),
+                 headers={"Content-Type": "application/json"})
+    response = conn.getresponse()
+    raw = response.read()
+    print("prepare-upload → HTTP %d %s" % (response.status, raw.decode("utf-8", "replace")))
+    if response.status != 200:
+        return 1
+    prepared = json.loads(raw)
+    conn.close()
+
+    for file_id, path in zip(offered, paths):
+        size = os.path.getsize(path)
+        query = "?sessionId=%s&fileId=%s&token=%s" % (
+            prepared["sessionId"], file_id, prepared["files"][file_id])
+        conn = http.client.HTTPConnection(args.host, args.port, timeout=600)
+        conn.putrequest("POST", "/api/localsend/v2/upload" + query)
+        conn.putheader("Content-Type", "application/octet-stream")
+        conn.putheader("Content-Length", str(size))
+        conn.endheaders()
+        with open(path, "rb") as handle:
+            while True:
+                chunk = handle.read(256 * 1024)
+                if not chunk:
+                    break
+                conn.send(chunk)
+        response = conn.getresponse()
+        response.read()
+        print("upload %-30s → HTTP %d" % (os.path.basename(path), response.status))
+        conn.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

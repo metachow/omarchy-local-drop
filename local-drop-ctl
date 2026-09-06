@@ -1,0 +1,82 @@
+#!/usr/bin/python3
+"""Talk to the LocalDrop daemon over its control socket.
+
+Usage:
+  local-drop-ctl status
+  local-drop-ctl devices
+  local-drop-ctl send <fingerprint> <file> [file...]
+  local-drop-ctl send-clipboard <fingerprint>
+  local-drop-ctl accept [sessionId] | decline [sessionId]
+  local-drop-ctl mode <off|ask|auto>
+  local-drop-ctl alias <name>
+  local-drop-ctl announce | clear | quit
+"""
+
+import json
+import os
+import socket
+import sys
+
+SOCKET_PATH = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "omarchy-local-drop", "control.sock")
+
+
+def call(message):
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(20)
+    sock.connect(SOCKET_PATH)
+    sock.sendall((json.dumps(message) + "\n").encode("utf-8"))
+    chunks = []
+    while b"\n" not in b"".join(chunks):
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    sock.close()
+    return json.loads(b"".join(chunks).split(b"\n", 1)[0].decode("utf-8"))
+
+
+def build(argv):
+    command = argv[0] if argv else "status"
+    rest = argv[1:]
+    if command in ("status", "devices", "announce", "clear", "quit"):
+        return {"cmd": command}
+    if command == "send":
+        if len(rest) < 2:
+            raise SystemExit("usage: local-drop-ctl send <fingerprint> <file> [file...]")
+        return {"cmd": "send", "fingerprint": rest[0],
+                "files": [os.path.abspath(p) for p in rest[1:]]}
+    if command == "send-clipboard":
+        if not rest:
+            raise SystemExit("usage: local-drop-ctl send-clipboard <fingerprint>")
+        return {"cmd": "send-clipboard", "fingerprint": rest[0]}
+    if command in ("accept", "decline"):
+        return {"cmd": "respond", "accept": command == "accept",
+                "sessionId": rest[0] if rest else ""}
+    if command == "mode":
+        if not rest:
+            raise SystemExit("usage: local-drop-ctl mode <off|ask|auto>")
+        return {"cmd": "mode", "mode": rest[0]}
+    if command == "alias":
+        if not rest:
+            raise SystemExit("usage: local-drop-ctl alias <name>")
+        return {"cmd": "alias", "alias": " ".join(rest)}
+    raise SystemExit(__doc__.strip())
+
+
+def main():
+    message = build(sys.argv[1:])
+    try:
+        reply = call(message)
+    except (OSError, ValueError) as exc:
+        print("LocalDrop daemon is not reachable: %s" % exc, file=sys.stderr)
+        return 2
+    if message["cmd"] in ("status", "devices"):
+        print(json.dumps(reply.get("state") or reply.get("devices"), indent=2))
+    else:
+        print(reply.get("message", "ok"))
+    return 0 if reply.get("ok") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

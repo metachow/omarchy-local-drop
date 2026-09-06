@@ -1,0 +1,1042 @@
+#!/usr/bin/python3
+"""LocalDrop daemon for the Omarchy shell.
+
+Speaks the LocalSend v2 protocol so the bar widget can discover nearby
+devices, receive files with an explicit accept step, and push files back
+out — the LocalDrop round trip, without the Flutter app.
+
+Everything the panel needs lands in a single JSON state file that QML
+watches; everything the panel wants to do arrives as one JSON line on a
+unix socket.  No third-party modules.
+"""
+
+import errno
+import json
+import os
+import re
+import shutil
+import socket
+import ssl
+import struct
+import subprocess
+import sys
+import threading
+import time
+import uuid
+import http.client
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+
+MULTICAST_GROUP = "224.0.0.167"
+DEFAULT_PORT = 53317
+PROTOCOL_VERSION = "2.1"
+ANNOUNCE_INTERVAL = 6.0
+DEVICE_TTL = 90.0
+ASK_TIMEOUT = 60.0
+MAX_TRANSFERS = 10
+NOTIFY_GLYPH = "󰀂"
+
+HOME = os.path.expanduser("~")
+CONFIG_PATH = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")),
+    "omarchy", "local-drop.json")
+RUNTIME_DIR = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "omarchy-local-drop")
+STATE_PATH = os.path.join(RUNTIME_DIR, "state.json")
+SOCKET_PATH = os.path.join(RUNTIME_DIR, "control.sock")
+# Clipboard payloads are written here before they are sent. It lives in the
+# runtime dir, so the session takes the leftovers with it.
+OUTGOING_DIR = os.path.join(RUNTIME_DIR, "outgoing")
+# Our own self-signed certificate and key, in one PEM bundle. LocalSend peers
+# ask for a client certificate during the handshake and identify each other by
+# its fingerprint, so we have to have one to talk to them at all.
+CERT_PATH = os.path.join(os.path.dirname(CONFIG_PATH), "local-drop-cert.pem")
+
+# What a clipboard is worth sending as, best first.
+CLIPBOARD_TYPES = [
+    ("image/png", "png"),
+    ("image/jpeg", "jpg"),
+    ("image/webp", "webp"),
+    ("image/gif", "gif"),
+    ("text/plain;charset=utf-8", "txt"),
+    ("text/plain", "txt"),
+    ("text/uri-list", "txt"),
+]
+
+
+def log(*parts):
+    print("[local-dropd]", *parts, file=sys.stderr, flush=True)
+
+
+def clean_text(value, limit=200):
+    """Strip a string down to something safe to hand argv or show in the panel.
+
+    A peer that answers TLS to our plaintext request hands back a raw alert
+    record, and its repr carries NUL bytes; interpolated into a notification
+    argument that raises ValueError deep inside subprocess, which used to take
+    the whole send worker down with it.
+    """
+    text = "".join(ch if ch.isprintable() else " " for ch in str(value))
+    text = " ".join(text.split())
+    return text[:limit]
+
+
+def notify(headline, description="", urgency="low"):
+    if not shutil.which("omarchy-notification-send"):
+        return
+    try:
+        subprocess.Popen(
+            ["omarchy-notification-send", "--app-name", "LocalDrop",
+             "-g", NOTIFY_GLYPH, "-u", urgency,
+             clean_text(headline, 120), clean_text(description, 200)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+def download_dir():
+    try:
+        out = subprocess.run(["xdg-user-dir", "DOWNLOAD"], capture_output=True,
+                             text=True, timeout=5).stdout.strip()
+        if out and os.path.isdir(out):
+            return out
+    except (OSError, subprocess.SubprocessError):
+        pass
+    fallback = os.path.join(HOME, "Downloads")
+    os.makedirs(fallback, exist_ok=True)
+    return fallback
+
+
+def safe_name(raw):
+    """A peer-supplied file name reduced to something safe to join onto a dir."""
+    name = os.path.basename(str(raw or "").replace("\\", "/")).strip()
+    name = re.sub(r"[\x00-\x1f]", "", name)
+    if name in ("", ".", ".."):
+        name = "local-drop-file"
+    return name[:180]
+
+
+def unique_path(directory, name):
+    candidate = os.path.join(directory, name)
+    if not os.path.exists(candidate):
+        return candidate
+    stem, ext = os.path.splitext(name)
+    for i in range(1, 1000):
+        candidate = os.path.join(directory, "%s (%d)%s" % (stem, i, ext))
+        if not os.path.exists(candidate):
+            return candidate
+    return os.path.join(directory, "%s-%s%s" % (stem, uuid.uuid4().hex[:6], ext))
+
+
+def guess_mime(name):
+    import mimetypes
+    return mimetypes.guess_type(name)[0] or "application/octet-stream"
+
+
+def interface_indexes():
+    try:
+        return [index for index, _ in socket.if_nameindex()]
+    except OSError:
+        return []
+
+
+class Config:
+    """Small persisted settings blob: identity plus the receive mode."""
+
+    def __init__(self):
+        self.data = {}
+        self.load()
+
+    def load(self):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if isinstance(loaded, dict):
+                self.data = loaded
+        except (OSError, ValueError):
+            self.data = {}
+        changed = False
+        if not self.data.get("fingerprint"):
+            self.data["fingerprint"] = uuid.uuid4().hex + uuid.uuid4().hex[:8]
+            changed = True
+        if not self.data.get("alias"):
+            self.data["alias"] = socket.gethostname() or "Omarchy"
+            changed = True
+        if self.data.get("receiveMode") not in ("off", "ask", "auto"):
+            self.data["receiveMode"] = "ask"
+            changed = True
+        if changed:
+            self.save()
+
+    def save(self):
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        tmp = CONFIG_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(self.data, handle, indent=2)
+        os.replace(tmp, CONFIG_PATH)
+
+    def get(self, key, fallback=None):
+        return self.data.get(key, fallback)
+
+    def set(self, key, value):
+        self.data[key] = value
+        self.save()
+
+
+class Session:
+    """One accepted incoming transfer, alive until every file has landed."""
+
+    def __init__(self, session_id, peer, files):
+        self.id = session_id
+        self.peer = peer
+        self.files = files            # file_id -> metadata dict
+        self.tokens = {}              # file_id -> token
+        self.done = set()
+        self.created = time.time()
+
+
+class Daemon:
+    def __init__(self):
+        self.config = Config()
+        self.port = int(self.config.get("port", DEFAULT_PORT))
+        self.lock = threading.RLock()
+        self.devices = {}             # fingerprint -> device dict
+        self.transfers = []           # newest last
+        self.incoming = None          # pending accept request shown in the panel
+        self.incoming_event = threading.Event()
+        self.incoming_accepted = False
+        self.session = None
+        self.receiving = False
+        self.error = ""
+        self.save_dir = download_dir()
+        self.stopping = threading.Event()
+        # Two threads publishing at once both wrote state.json.tmp and both
+        # renamed it; the loser's rename hit a file that was already gone.
+        self.publish_lock = threading.RLock()
+        self.udp = None
+        self.http = None
+
+    # ------------------------------------------------------------- identity
+    @property
+    def fingerprint(self):
+        return self.config.get("fingerprint")
+
+    @property
+    def alias(self):
+        return self.config.get("alias")
+
+    @property
+    def mode(self):
+        return self.config.get("receiveMode", "ask")
+
+    def info(self, announce=None):
+        payload = {
+            "alias": self.alias,
+            "version": PROTOCOL_VERSION,
+            "deviceModel": "Omarchy",
+            "deviceType": "desktop",
+            "fingerprint": self.fingerprint,
+            "port": self.port,
+            "protocol": "http",
+            "download": False,
+        }
+        if announce is not None:
+            payload["announce"] = announce
+        return payload
+
+    # ---------------------------------------------------------------- state
+    def publish(self):
+        with self.lock:
+            now = time.time()
+            devices = [d for d in self.devices.values()
+                       if now - d.get("lastSeen", 0) <= DEVICE_TTL]
+            devices.sort(key=lambda d: str(d.get("alias", "")).lower())
+            state = {
+                "ok": True,
+                "alias": self.alias,
+                "fingerprint": self.fingerprint,
+                "port": self.port,
+                "receiveMode": self.mode,
+                "receiving": self.receiving,
+                "saveDir": self.save_dir,
+                "error": self.error,
+                "devices": devices,
+                "incoming": self.incoming,
+                "transfers": list(self.transfers),
+                "updated": now,
+            }
+        os.makedirs(RUNTIME_DIR, exist_ok=True)
+        with self.publish_lock:
+            tmp = STATE_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(state, handle)
+            os.replace(tmp, STATE_PATH)
+        return state
+
+    def track(self, transfer):
+        with self.lock:
+            self.transfers = [t for t in self.transfers if t["id"] != transfer["id"]]
+            self.transfers.append(transfer)
+            if len(self.transfers) > MAX_TRANSFERS:
+                self.transfers = self.transfers[-MAX_TRANSFERS:]
+        self.publish()
+
+    def remember(self, payload, ip, source="udp"):
+        fingerprint = str(payload.get("fingerprint") or "")
+        if not fingerprint or fingerprint == self.fingerprint:
+            return None
+        with self.lock:
+            device = self.devices.get(fingerprint, {})
+            device.update({
+                "fingerprint": fingerprint,
+                "alias": str(payload.get("alias") or "Unknown device")[:64],
+                "ip": ip,
+                "port": int(payload.get("port") or DEFAULT_PORT),
+                "deviceType": str(payload.get("deviceType") or "desktop"),
+                "deviceModel": str(payload.get("deviceModel") or ""),
+                "protocol": "https" if payload.get("protocol") == "https" else "http",
+                "lastSeen": time.time(),
+                "source": source,
+            })
+            self.devices[fingerprint] = device
+        return device
+
+    # ------------------------------------------------------------ discovery
+    def open_udp(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except OSError:
+            pass
+        sock.bind(("", self.port))
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+        # Loop announcements back to this host too, so a LocalSend app running
+        # alongside the daemon still sees us.
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
+        group = socket.inet_aton(MULTICAST_GROUP)
+        joined = False
+        for index in interface_indexes():
+            try:
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                                struct.pack("=4s4si", group, socket.inet_aton("0.0.0.0"), index))
+                joined = True
+            except OSError:
+                continue
+        if not joined:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                            struct.pack("=4s4s", group, socket.inet_aton("0.0.0.0")))
+        sock.settimeout(1.0)
+        self.udp = sock
+
+    def send_announcement(self, announce=True, unicast=None):
+        if not self.udp:
+            return
+        blob = json.dumps(self.info(announce=announce)).encode("utf-8")
+        if unicast:
+            try:
+                self.udp.sendto(blob, unicast)
+            except OSError:
+                pass
+            return
+        targets = interface_indexes() or [0]
+        for index in targets:
+            try:
+                self.udp.setsockopt(
+                    socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
+                    struct.pack("=4s4si", socket.inet_aton("0.0.0.0"),
+                                socket.inet_aton("0.0.0.0"), index))
+                self.udp.sendto(blob, (MULTICAST_GROUP, self.port))
+            except OSError:
+                continue
+
+    def certificate(self):
+        """Path to our PEM bundle, generating it the first time it is needed."""
+        if os.path.exists(CERT_PATH):
+            return CERT_PATH
+        if not shutil.which("openssl"):
+            log("openssl is missing; encrypted peers will refuse the handshake")
+            return None
+        os.makedirs(os.path.dirname(CERT_PATH), exist_ok=True)
+        key = CERT_PATH + ".key"
+        crt = CERT_PATH + ".crt"
+        try:
+            subprocess.run(
+                ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                 "-days", "3650", "-subj", "/CN=LocalDrop",
+                 "-keyout", key, "-out", crt],
+                check=True, capture_output=True, timeout=60)
+            with open(CERT_PATH, "wb") as bundle:
+                for part in (crt, key):
+                    with open(part, "rb") as handle:
+                        bundle.write(handle.read())
+            os.chmod(CERT_PATH, 0o600)
+        except (OSError, subprocess.SubprocessError) as exc:
+            log("could not create a certificate: %s" % exc)
+            return None
+        finally:
+            for part in (key, crt):
+                try:
+                    os.unlink(part)
+                except OSError:
+                    pass
+        return CERT_PATH
+
+    def connect(self, device, timeout):
+        """A connection to a peer, TLS if that is what it announced.
+
+        LocalSend devices carry self-signed certificates and identify each
+        other by fingerprint rather than by CA, so verification is off by
+        design — the same thing every LocalSend client does.
+        """
+        host, port = device["ip"], device["port"]
+        if device.get("protocol") == "https":
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            bundle = self.certificate()
+            if bundle:
+                try:
+                    context.load_cert_chain(bundle)
+                except (OSError, ssl.SSLError) as exc:
+                    log("ignoring unusable certificate %s: %s" % (bundle, exc))
+            return http.client.HTTPSConnection(host, port, timeout=timeout,
+                                               context=context)
+        return http.client.HTTPConnection(host, port, timeout=timeout)
+
+    def register_with(self, device):
+        """Answer an announcement over HTTP too — mobile clients prefer it."""
+        try:
+            conn = self.connect(device, 4)
+            conn.request("POST", "/api/localsend/v2/register",
+                         body=json.dumps(self.info()).encode("utf-8"),
+                         headers={"Content-Type": "application/json"})
+            conn.getresponse().read()
+            conn.close()
+        except (OSError, http.client.HTTPException):
+            pass
+
+    def discovery_loop(self):
+        while not self.stopping.is_set():
+            try:
+                data, addr = self.udp.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                if self.stopping.is_set():
+                    return
+                time.sleep(0.5)
+                continue
+            try:
+                payload = json.loads(data.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            device = self.remember(payload, addr[0])
+            if device is None:
+                continue
+            self.publish()
+            if payload.get("announce"):
+                self.send_announcement(announce=False, unicast=(addr[0], device["port"]))
+                threading.Thread(target=self.register_with, args=(device,),
+                                 daemon=True).start()
+
+    def announce_loop(self):
+        while not self.stopping.is_set():
+            if self.mode != "off":
+                self.send_announcement(announce=True)
+            self.prune()
+            self.stopping.wait(ANNOUNCE_INTERVAL)
+
+    def prune(self):
+        now = time.time()
+        with self.lock:
+            stale = [f for f, d in self.devices.items()
+                     if now - d.get("lastSeen", 0) > DEVICE_TTL]
+            for fingerprint in stale:
+                del self.devices[fingerprint]
+        if stale:
+            self.publish()
+
+    # -------------------------------------------------------------- receive
+    def request_permission(self, peer, files):
+        """Park an incoming transfer in the panel and wait for a verdict."""
+        if self.mode == "off":
+            return False
+        total = sum(int(f.get("size") or 0) for f in files.values())
+        names = [safe_name(f.get("fileName")) for f in files.values()]
+        if self.mode == "auto":
+            notify("Receiving %d file%s" % (len(files), "" if len(files) == 1 else "s"),
+                   "From %s" % peer.get("alias", "a device"))
+            return True
+        with self.lock:
+            if self.incoming is not None:
+                return False
+            self.incoming = {
+                "sessionId": uuid.uuid4().hex,
+                "alias": peer.get("alias", "Unknown device"),
+                "deviceType": peer.get("deviceType", "desktop"),
+                "fileCount": len(files),
+                "totalSize": total,
+                "names": names[:6],
+                "requested": time.time(),
+            }
+            self.incoming_accepted = False
+        self.incoming_event.clear()
+        self.publish()
+        notify("%s wants to send %d file%s" % (
+            self.incoming["alias"], len(files), "" if len(files) == 1 else "s"),
+            "Open LocalDrop in the bar to accept", urgency="normal")
+        accepted = self.incoming_event.wait(ASK_TIMEOUT) and self.incoming_accepted
+        with self.lock:
+            self.incoming = None
+        self.publish()
+        return accepted
+
+    def resolve_incoming(self, session_id, accept):
+        with self.lock:
+            if not self.incoming:
+                return "no pending request"
+            if session_id and session_id != self.incoming.get("sessionId"):
+                return "stale request"
+            self.incoming_accepted = bool(accept)
+        self.incoming_event.set()
+        return "ok"
+
+    def start_session(self, peer, files):
+        session = Session(uuid.uuid4().hex, peer, files)
+        for file_id in files:
+            session.tokens[file_id] = uuid.uuid4().hex
+        with self.lock:
+            self.session = session
+        self.track({
+            "id": session.id,
+            "direction": "receive",
+            "peer": peer.get("alias", "Unknown device"),
+            "files": len(files),
+            "fileName": safe_name(next(iter(files.values())).get("fileName")) if files else "",
+            "bytes": 0,
+            "total": sum(int(f.get("size") or 0) for f in files.values()),
+            "status": "active",
+            "error": "",
+            "updated": time.time(),
+        })
+        return session
+
+    def finish_session(self, session):
+        with self.lock:
+            if self.session is session:
+                self.session = None
+        for transfer in self.transfers:
+            if transfer["id"] == session.id and transfer["status"] == "active":
+                transfer["status"] = "done"
+                transfer["updated"] = time.time()
+        self.publish()
+        count = len(session.done)
+        notify("Received %d file%s" % (count, "" if count == 1 else "s"),
+               "Saved to %s" % self.save_dir)
+
+    def fail_receive(self, session, message):
+        for transfer in self.transfers:
+            if transfer["id"] == session.id and transfer["status"] == "active":
+                transfer["status"] = "failed"
+                transfer["error"] = message
+                transfer["updated"] = time.time()
+        with self.lock:
+            if self.session is session:
+                self.session = None
+        self.publish()
+
+    # ----------------------------------------------------------------- send
+    def send_files(self, fingerprint, paths):
+        with self.lock:
+            device = self.devices.get(fingerprint)
+        if not device:
+            return "device is no longer nearby"
+        existing = [p for p in paths if os.path.isfile(p)]
+        if not existing:
+            return "no readable files"
+        threading.Thread(target=self._send_worker, args=(device, existing),
+                         daemon=True).start()
+        return "ok"
+
+    def clipboard_file(self):
+        """Spill the clipboard to a file the LocalSend side can accept.
+
+        Returns (path, error). An image beats text when the clipboard holds
+        both, which is what a screenshot lands there as.
+        """
+        if not shutil.which("wl-paste"):
+            return None, "wl-paste is not installed"
+        try:
+            listing = subprocess.run(["wl-paste", "--list-types"], capture_output=True,
+                                     text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return None, "could not read the clipboard (%s)" % exc
+        offered = {line.strip().lower() for line in listing.stdout.split() if line.strip()}
+        if not offered:
+            return None, "the clipboard is empty"
+
+        chosen = next(((mime, ext) for mime, ext in CLIPBOARD_TYPES
+                       if mime in offered), None)
+        if chosen is None:
+            # Something exotic (a file manager's own format); take whatever the
+            # first offer is and send it as bytes rather than refusing outright.
+            chosen = (sorted(offered)[0], "bin")
+        mime, ext = chosen
+
+        command = ["wl-paste", "--type", mime]
+        if ext == "txt":
+            command.insert(1, "--no-newline")
+        try:
+            captured = subprocess.run(command, capture_output=True, timeout=20)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return None, "could not read the clipboard (%s)" % exc
+        if captured.returncode != 0 or not captured.stdout:
+            return None, "the clipboard is empty"
+
+        os.makedirs(OUTGOING_DIR, exist_ok=True)
+        name = "clipboard-%s.%s" % (time.strftime("%Y%m%d-%H%M%S"), ext)
+        path = os.path.join(OUTGOING_DIR, name)
+        with open(path, "wb") as handle:
+            handle.write(captured.stdout)
+        return path, ""
+
+    def send_clipboard(self, fingerprint):
+        with self.lock:
+            device = self.devices.get(fingerprint)
+        if not device:
+            return "device is no longer nearby"
+        path, error = self.clipboard_file()
+        if path is None:
+            return error
+        threading.Thread(target=self._send_worker, args=(device, [path]),
+                         daemon=True).start()
+        return "ok"
+
+    def _send_worker(self, device, paths):
+        transfer_id = uuid.uuid4().hex
+        total = sum(os.path.getsize(p) for p in paths)
+        transfer = {
+            "id": transfer_id,
+            "direction": "send",
+            "peer": device.get("alias", "device"),
+            "files": len(paths),
+            "fileName": os.path.basename(paths[0]),
+            "bytes": 0,
+            "total": total,
+            "status": "active",
+            "error": "",
+            "updated": time.time(),
+        }
+        self.track(transfer)
+
+        def fail(message):
+            transfer["status"] = "failed"
+            transfer["error"] = clean_text(message, 160)
+            transfer["updated"] = time.time()
+            self.track(transfer)
+            notify("LocalDrop failed", message, urgency="normal")
+
+        files = {}
+        ids = {}
+        for path in paths:
+            file_id = uuid.uuid4().hex
+            ids[file_id] = path
+            files[file_id] = {
+                "id": file_id,
+                "fileName": os.path.basename(path),
+                "size": os.path.getsize(path),
+                "fileType": guess_mime(path),
+                "sha256": None,
+                "preview": None,
+            }
+        body = json.dumps({"info": self.info(), "files": files}).encode("utf-8")
+        try:
+            conn = self.connect(device, 90)
+            conn.request("POST", "/api/localsend/v2/prepare-upload", body=body,
+                         headers={"Content-Type": "application/json"})
+            response = conn.getresponse()
+            raw = response.read()
+            status = response.status
+            conn.close()
+        except (OSError, http.client.HTTPException) as exc:
+            return fail("could not reach %s (%s)" % (device.get("alias", "device"), exc))
+
+        if status == 403:
+            transfer["status"] = "declined"
+            transfer["updated"] = time.time()
+            self.track(transfer)
+            notify("LocalDrop declined", "%s rejected the transfer" % device.get("alias", "device"))
+            return
+        if status == 204:
+            return fail("%s has nothing to receive with" % device.get("alias", "device"))
+        if status != 200:
+            return fail("%s answered HTTP %d" % (device.get("alias", "device"), status))
+        try:
+            prepared = json.loads(raw.decode("utf-8"))
+            session_id = prepared["sessionId"]
+            tokens = prepared["files"]
+        except (ValueError, KeyError, UnicodeDecodeError):
+            return fail("unexpected answer from %s" % device.get("alias", "device"))
+
+        sent = 0
+        for file_id, path in ids.items():
+            token = tokens.get(file_id)
+            if not token:
+                continue
+            size = os.path.getsize(path)
+            query = "?sessionId=%s&fileId=%s&token=%s" % (session_id, file_id, token)
+            try:
+                conn = self.connect(device, 900)
+                conn.putrequest("POST", "/api/localsend/v2/upload" + query)
+                conn.putheader("Content-Type", "application/octet-stream")
+                conn.putheader("Content-Length", str(size))
+                conn.endheaders()
+                with open(path, "rb") as handle:
+                    last = 0.0
+                    while True:
+                        chunk = handle.read(256 * 1024)
+                        if not chunk:
+                            break
+                        conn.send(chunk)
+                        sent += len(chunk)
+                        if time.time() - last > 0.2:
+                            last = time.time()
+                            transfer["bytes"] = sent
+                            transfer["updated"] = last
+                            self.track(transfer)
+                response = conn.getresponse()
+                response.read()
+                code = response.status
+                conn.close()
+            except (OSError, http.client.HTTPException) as exc:
+                return fail("upload interrupted (%s)" % exc)
+            if code not in (200, 204):
+                return fail("%s refused %s (HTTP %d)" % (
+                    device.get("alias", "device"), os.path.basename(path), code))
+
+        transfer["bytes"] = total
+        transfer["status"] = "done"
+        transfer["updated"] = time.time()
+        self.track(transfer)
+        notify("Sent %d file%s" % (len(paths), "" if len(paths) == 1 else "s"),
+               "To %s" % device.get("alias", "device"))
+
+    # -------------------------------------------------------------- control
+    def handle_command(self, message):
+        command = str(message.get("cmd") or "")
+        if command == "status":
+            return {"ok": True, "state": self.publish()}
+        if command == "devices":
+            return {"ok": True, "devices": self.publish()["devices"]}
+        if command == "send":
+            result = self.send_files(str(message.get("fingerprint") or ""),
+                                     [str(p) for p in message.get("files") or []])
+            return {"ok": result == "ok", "message": result}
+        if command == "send-clipboard":
+            result = self.send_clipboard(str(message.get("fingerprint") or ""))
+            return {"ok": result == "ok", "message": result}
+        if command == "respond":
+            result = self.resolve_incoming(str(message.get("sessionId") or ""),
+                                           bool(message.get("accept")))
+            return {"ok": result == "ok", "message": result}
+        if command == "mode":
+            mode = str(message.get("mode") or "")
+            if mode not in ("off", "ask", "auto"):
+                return {"ok": False, "message": "mode must be off, ask or auto"}
+            self.config.set("receiveMode", mode)
+            if mode != "off":
+                self.send_announcement(announce=True)
+            self.publish()
+            return {"ok": True, "message": mode}
+        if command == "alias":
+            alias = str(message.get("alias") or "").strip()[:64]
+            if not alias:
+                return {"ok": False, "message": "alias must not be empty"}
+            self.config.set("alias", alias)
+            self.send_announcement(announce=True)
+            self.publish()
+            return {"ok": True, "message": alias}
+        if command == "announce":
+            self.send_announcement(announce=True)
+            return {"ok": True, "message": "announced"}
+        if command == "clear":
+            with self.lock:
+                self.transfers = [t for t in self.transfers if t["status"] == "active"]
+            self.publish()
+            return {"ok": True, "message": "cleared"}
+        if command == "quit":
+            self.stopping.set()
+            return {"ok": True, "message": "stopping"}
+        return {"ok": False, "message": "unknown command %r" % command}
+
+    def control_loop(self):
+        os.makedirs(RUNTIME_DIR, exist_ok=True)
+        try:
+            os.unlink(SOCKET_PATH)
+        except FileNotFoundError:
+            pass
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            server.bind(SOCKET_PATH)
+            os.chmod(SOCKET_PATH, 0o600)
+        except OSError as exc:
+            # Without the control socket the panel can still watch state, but
+            # every button would be dead — say so where the panel can show it.
+            self.error = "control socket unavailable: %s" % exc
+            log(self.error)
+            self.publish()
+            return
+        server.listen(8)
+        server.settimeout(1.0)
+        while not self.stopping.is_set():
+            try:
+                conn, _ = server.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(target=self.serve_control, args=(conn,),
+                             daemon=True).start()
+        server.close()
+        try:
+            os.unlink(SOCKET_PATH)
+        except OSError:
+            pass
+
+    def serve_control(self, conn):
+        with conn:
+            conn.settimeout(30)
+            try:
+                chunks = []
+                while b"\n" not in b"".join(chunks):
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    if sum(len(c) for c in chunks) > 1 << 20:
+                        break
+                line = b"".join(chunks).split(b"\n", 1)[0]
+                message = json.loads(line.decode("utf-8"))
+                reply = self.handle_command(message if isinstance(message, dict) else {})
+            except (OSError, ValueError, UnicodeDecodeError) as exc:
+                reply = {"ok": False, "message": str(exc)}
+            try:
+                conn.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+            except OSError:
+                pass
+
+    # ----------------------------------------------------------------- boot
+    def bind_http(self):
+        """Claim the LocalSend port, or explain why we could not."""
+        if self.http is not None:
+            return True
+        try:
+            server = ThreadingHTTPServer(("", self.port), make_handler(self))
+        except OSError as exc:
+            self.receiving = False
+            if exc.errno == errno.EADDRINUSE:
+                self.error = ("port %d is taken (is the LocalSend app running?) — "
+                              "sending still works" % self.port)
+            else:
+                self.error = "cannot listen on port %d: %s" % (self.port, exc)
+            log(self.error)
+            return False
+        server.daemon_threads = True
+        self.http = server
+        self.receiving = True
+        self.error = ""
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return True
+
+    def rebind_loop(self):
+        """Whoever held the port may hand it back; keep asking for it."""
+        while not self.stopping.is_set():
+            self.stopping.wait(15.0)
+            if self.stopping.is_set():
+                return
+            if self.http is None and self.bind_http():
+                self.publish()
+
+    def run(self):
+        os.makedirs(RUNTIME_DIR, exist_ok=True)
+        shutil.rmtree(OUTGOING_DIR, ignore_errors=True)
+        try:
+            self.open_udp()
+        except OSError as exc:
+            self.error = "discovery unavailable: %s" % exc
+            log(self.error)
+
+        self.bind_http()
+
+        threads = [threading.Thread(target=self.control_loop, daemon=True),
+                   threading.Thread(target=self.rebind_loop, daemon=True)]
+        if self.udp:
+            threads.append(threading.Thread(target=self.discovery_loop, daemon=True))
+            threads.append(threading.Thread(target=self.announce_loop, daemon=True))
+        for thread in threads:
+            thread.start()
+        self.publish()
+        try:
+            while not self.stopping.is_set():
+                self.stopping.wait(1.0)
+        except KeyboardInterrupt:
+            pass
+        self.stopping.set()
+        if self.http:
+            self.http.shutdown()
+        if self.udp:
+            self.udp.close()
+
+
+def make_handler(daemon):
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        server_version = "OmarchyLocalDrop/1.0"
+
+        def log_message(self, *_args):
+            pass
+
+        # ------------------------------------------------------- primitives
+        def route(self):
+            parsed = urlparse(self.path)
+            path = re.sub(r"^/api/localsend/v[12]", "", parsed.path).rstrip("/")
+            return path, parse_qs(parsed.query)
+
+        def reply(self, status, payload=None):
+            body = b"" if payload is None else json.dumps(payload).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
+
+        def read_json(self, limit=4 << 20):
+            length = int(self.headers.get("Content-Length") or 0)
+            if length <= 0 or length > limit:
+                return None
+            try:
+                return json.loads(self.rfile.read(length).decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return None
+
+        # ----------------------------------------------------------- routes
+        def do_GET(self):
+            path, _ = self.route()
+            if path in ("/info", "/register"):
+                return self.reply(200, daemon.info())
+            self.reply(404, {"message": "not found"})
+
+        def do_POST(self):
+            path, query = self.route()
+            if path == "/register":
+                return self.handle_register()
+            if path == "/prepare-upload":
+                return self.handle_prepare()
+            if path == "/upload":
+                return self.handle_upload(query)
+            if path == "/cancel":
+                return self.handle_cancel()
+            self.reply(404, {"message": "not found"})
+
+        def handle_register(self):
+            payload = self.read_json() or {}
+            if isinstance(payload, dict):
+                if daemon.remember(payload, self.client_address[0], source="http"):
+                    daemon.publish()
+            self.reply(200, daemon.info())
+
+        def handle_prepare(self):
+            payload = self.read_json()
+            if not isinstance(payload, dict):
+                return self.reply(400, {"message": "invalid body"})
+            if daemon.mode == "off":
+                return self.reply(403, {"message": "receiving is off"})
+            files = payload.get("files")
+            if not isinstance(files, dict) or not files:
+                return self.reply(400, {"message": "no files"})
+            peer = payload.get("info") if isinstance(payload.get("info"), dict) else {}
+            daemon.remember(peer, self.client_address[0], source="http")
+            with daemon.lock:
+                busy = daemon.session is not None
+            if busy:
+                return self.reply(409, {"message": "already receiving"})
+            if not daemon.request_permission(peer, files):
+                return self.reply(403, {"message": "declined"})
+            session = daemon.start_session(peer, files)
+            self.reply(200, {"sessionId": session.id, "files": session.tokens})
+
+        def handle_upload(self, query):
+            session_id = (query.get("sessionId") or [""])[0]
+            file_id = (query.get("fileId") or [""])[0]
+            token = (query.get("token") or [""])[0]
+            with daemon.lock:
+                session = daemon.session
+            if not session or session.id != session_id:
+                return self.reply(403, {"message": "unknown session"})
+            if session.tokens.get(file_id) != token or not token:
+                return self.reply(403, {"message": "bad token"})
+
+            meta = session.files.get(file_id) or {}
+            declared = int(meta.get("size") or 0)
+            length = int(self.headers.get("Content-Length") or 0)
+            if length <= 0 or (declared and length > declared + (1 << 20)):
+                return self.reply(400, {"message": "unexpected body size"})
+
+            os.makedirs(daemon.save_dir, exist_ok=True)
+            target = unique_path(daemon.save_dir, safe_name(meta.get("fileName")))
+            partial = target + ".part"
+            written = 0
+            try:
+                with open(partial, "wb") as handle:
+                    while written < length:
+                        chunk = self.rfile.read(min(256 * 1024, length - written))
+                        if not chunk:
+                            raise OSError("connection closed early")
+                        handle.write(chunk)
+                        written += len(chunk)
+                        self.report(session, file_id, written)
+                os.replace(partial, target)
+            except OSError as exc:
+                try:
+                    os.unlink(partial)
+                except OSError:
+                    pass
+                daemon.fail_receive(session, str(exc))
+                return self.reply(500, {"message": "write failed"})
+
+            session.done.add(file_id)
+            self.report(session, file_id, written, final=True)
+            self.reply(200, {})
+            if len(session.done) >= len(session.files):
+                daemon.finish_session(session)
+
+        def report(self, session, file_id, written, final=False):
+            now = time.time()
+            if not final and now - getattr(self, "_last_report", 0) < 0.2:
+                return
+            self._last_report = now
+            done_bytes = sum(int((session.files.get(f) or {}).get("size") or 0)
+                             for f in session.done)
+            for transfer in daemon.transfers:
+                if transfer["id"] == session.id:
+                    transfer["bytes"] = done_bytes + (0 if final else written)
+                    transfer["updated"] = now
+            daemon.publish()
+
+        def handle_cancel(self):
+            with daemon.lock:
+                session = daemon.session
+                daemon.session = None
+            if session:
+                daemon.fail_receive(session, "cancelled by sender")
+            self.reply(200, {})
+
+    return Handler
+
+
+if __name__ == "__main__":
+    Daemon().run()
