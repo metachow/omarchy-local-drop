@@ -36,6 +36,8 @@ ASK_TIMEOUT = 60.0
 STALL_TIMEOUT = 60.0
 MAX_TRANSFERS = 10
 NOTIFY_GLYPH = "󰀂"
+# Fired once per landed file: `omarchy hook local-drop-received <path> <sender>`
+HOOK_NAME = "local-drop-received"
 
 HOME = os.path.expanduser("~")
 CONFIG_PATH = os.path.join(
@@ -193,6 +195,7 @@ class Session:
         self.files = files            # file_id -> metadata dict
         self.tokens = {}              # file_id -> token
         self.done = set()
+        self.saved = []
         self.created = time.time()
         self.progressed = time.time()
 
@@ -557,6 +560,21 @@ class Daemon:
         })
         return session
 
+    def run_received_hook(self, path, peer):
+        """Hand a landed file to ~/.config/omarchy/hooks/local-drop-received.d/.
+
+        Filing rules are personal, and an agent that reads file names off the
+        network is the user's call to make, not this daemon's — so the daemon
+        only reports the event and lets the hook decide.
+        """
+        if not shutil.which("omarchy"):
+            return
+        try:
+            subprocess.Popen(["omarchy", "hook", HOOK_NAME, path, peer],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            log("could not run the %s hook: %s" % (HOOK_NAME, exc))
+
     def finish_session(self, session):
         with self.lock:
             if self.session is session:
@@ -569,6 +587,9 @@ class Daemon:
         count = len(session.done)
         notify("Received %d file%s" % (count, "" if count == 1 else "s"),
                "Saved to %s" % self.save_dir)
+        peer = str(session.peer.get("alias", "a nearby device"))
+        for path in session.saved:
+            self.run_received_hook(path, peer)
 
     def fail_receive(self, session, message):
         for transfer in self.transfers:
@@ -1075,6 +1096,7 @@ def make_handler(daemon):
                 return self.reply(500, {"message": "write failed"})
 
             session.done.add(file_id)
+            session.saved.append(target)
             self.report(session, file_id, written, final=True)
             self.reply(200, {})
             if len(session.done) >= len(session.files):

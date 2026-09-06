@@ -52,6 +52,7 @@ overwritten — a second `report.pdf` is saved as `report (1).pdf`.
 | `Panel.qml` | Bar icon and popup |
 | `Service.qml` | Runs the daemon, mirrors its state file into QML |
 | `Model.js` | Formatting helpers and the bar glyphs |
+| `hooks/` | Sample filing hooks for received files |
 | `tests/` | Stand-ins for a second device — see [tests/README.md](tests/README.md) |
 
 The shell starts and supervises `local-dropd`; it needs no systemd unit and no
@@ -104,6 +105,42 @@ omarchy-shell io.github.metachow.local-drop clipboard <fingerprint>
   `omarchy toggle notification silencing`.
 - A sent clipboard is written to `$XDG_RUNTIME_DIR/omarchy-local-drop/outgoing/`
   first; the session clears that directory, and so does a daemon restart.
+
+## Filing what arrives
+
+Every file that lands fires an Omarchy hook, so where things end up is yours to
+decide:
+
+```
+omarchy hook local-drop-received <path-to-the-file> <sender name>
+```
+
+Drop any executable into `~/.config/omarchy/hooks/local-drop-received.d/` and it
+runs once per received file. Two are included:
+
+```bash
+omarchy hook install local-drop-received hooks/sort-by-type      # by file type
+omarchy hook install local-drop-received hooks/file-with-agent   # ask Claude
+```
+
+`sort-by-type` reads the MIME type and moves images to Pictures, video to
+Videos, audio to Music, documents to Documents, and leaves everything else in
+place. Deterministic and free.
+
+`file-with-agent` asks Claude Code where the file belongs, so it can act on what
+a name means rather than only what the bytes are — a PNG called
+`scan-of-lease-agreement.png` goes to Documents rather than Pictures. It costs
+one short Claude call per received file.
+
+Neither hook ever overwrites: they use `mv -n`, so a name collision leaves the
+new file where it landed.
+
+**If you write your own, remember the file name came off the network.** It is
+attacker-chosen text, and in the agent hook it goes into a prompt. That hook
+therefore never uses the model's answer as a path — the answer only picks from
+a fixed list of directories, and anything unrecognised means "leave it alone".
+A hook that ran `mv "$FILE" "$ANSWER"` would let a sender choose where their
+file lands by naming it cleverly.
 
 ## Dependencies
 

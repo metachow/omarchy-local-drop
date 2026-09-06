@@ -1,0 +1,29 @@
+#!/bin/bash
+# Move a received file into the directory its type belongs in.
+#
+# Install with:
+#   omarchy hook install local-drop-received <path-to-this-file>
+#
+# Arguments: $1 the file that just landed, $2 the sender's name.
+
+set -euo pipefail
+
+FILE=$1
+[[ -f $FILE ]] || exit 0
+
+case "$(file --brief --mime-type -- "$FILE")" in
+  image/*) DEST=$(xdg-user-dir PICTURES) ;;
+  video/*) DEST=$(xdg-user-dir VIDEOS) ;;
+  audio/*) DEST=$(xdg-user-dir MUSIC) ;;
+  application/pdf | application/vnd.openxmlformats* | application/msword | text/*)
+    DEST=$(xdg-user-dir DOCUMENTS) ;;
+  *) exit 0 ;;  # leave anything else where it landed
+esac
+
+[[ -n $DEST && -d $DEST ]] || exit 0
+
+# Never overwrite: mv -n keeps the existing file and leaves this one in place.
+mv -n -- "$FILE" "$DEST/" || exit 0
+
+omarchy-notification-send --app-name LocalDrop -g "󰀃" \
+  "Filed $(basename -- "$FILE")" "Moved to $DEST" || true
