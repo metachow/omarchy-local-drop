@@ -61,7 +61,7 @@ Settings (device name, receive mode, identity): `~/.config/omarchy/local-drop.js
 ## From the terminal
 
 ```bash
-cd ~/.config/omarchy/plugins/zhou-mi.local-drop
+cd ~/.config/omarchy/plugins/io.github.metachow.local-drop
 ./local-drop-ctl status                      # full state as JSON
 ./local-drop-ctl devices                     # what is nearby right now
 ./local-drop-ctl send <fingerprint> a.png    # fingerprints come from `devices`
@@ -73,11 +73,11 @@ cd ~/.config/omarchy/plugins/zhou-mi.local-drop
 And through the shell's IPC:
 
 ```bash
-omarchy-shell zhou-mi.local-drop toggle
-omarchy-shell zhou-mi.local-drop accept
-omarchy-shell zhou-mi.local-drop mode auto
-omarchy-shell zhou-mi.local-drop send <fingerprint>       # opens the file chooser
-omarchy-shell zhou-mi.local-drop clipboard <fingerprint>
+omarchy-shell io.github.metachow.local-drop toggle
+omarchy-shell io.github.metachow.local-drop accept
+omarchy-shell io.github.metachow.local-drop mode auto
+omarchy-shell io.github.metachow.local-drop send <fingerprint>       # opens the file chooser
+omarchy-shell io.github.metachow.local-drop clipboard <fingerprint>
 ```
 
 ## Notes
@@ -136,7 +136,7 @@ omarchy plugin add https://github.com/metachow/omarchy-local-drop --enable
 ## Uninstall
 
 ```bash
-omarchy plugin disable zhou-mi.local-drop
-rm -rf ~/.config/omarchy/plugins/zhou-mi.local-drop \
+omarchy plugin disable io.github.metachow.local-drop
+rm -rf ~/.config/omarchy/plugins/io.github.metachow.local-drop \
        ~/.config/omarchy/local-drop.json ~/.config/omarchy/local-drop-cert.pem
 ```

@@ -12,8 +12,8 @@ import "Model.js" as Model
 // the state file local-dropd publishes; every button posts one control command.
 Panel {
   id: root
-  moduleName: "zhou-mi.local-drop"
-  ipcTarget: "zhou-mi.local-drop"
+  moduleName: "io.github.metachow.local-drop"
+  ipcTarget: "io.github.metachow.local-drop"
   manageIpc: false
 
   readonly property string pluginDir: Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "")
@@ -69,7 +69,7 @@ Panel {
     ensureCursor()
   }
 
-  // Shared by the two IPC verbs: `omarchy-shell zhou-mi.local-drop send <fp>`
+  // Shared by the two IPC verbs: `omarchy-shell io.github.metachow.local-drop send <fp>`
   // opens the file chooser for that device, `clipboard <fp>` skips it.
   function actOnDevice(fingerprint, useClipboard) {
     var list = service.devices || []

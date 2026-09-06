@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "id": "zhou-mi.local-drop",
+  "id": "io.github.metachow.local-drop",
   "name": "LocalDrop",
   "version": "1.0.0",
   "author": "zhou-mi",
