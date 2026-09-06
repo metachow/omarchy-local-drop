@@ -105,6 +105,28 @@ omarchy-shell zhou-mi.local-drop clipboard <fingerprint>
 - A sent clipboard is written to `$XDG_RUNTIME_DIR/omarchy-local-drop/outgoing/`
   first; the session clears that directory, and so does a daemon restart.
 
+## Dependencies
+
+Everything it needs is already on a stock Omarchy install — there is nothing to
+install alongside it. Listed so you can check:
+
+| Needs | For | Package |
+|---|---|---|
+| `python3` | the daemon and the CLI (standard library only, no pip packages) | `python` |
+| `wl-paste` | reading the clipboard when you send it | `wl-clipboard` |
+| `openssl` | generating the client certificate encrypted peers ask for | `openssl` |
+| `xdg-user-dir` | finding your download directory | `xdg-user-dirs` |
+| `omarchy-file-select` | the file chooser | Omarchy |
+| `omarchy-notification-send` | desktop notifications | Omarchy |
+| `uwsm-app`, `xdg-open` | opening the download folder | Omarchy |
+
+The QML side needs Quickshell, which is what runs the Omarchy shell.
+
+No part of this plugin uses `sudo`, `pkexec`, or a systemd unit, and it writes
+only to `~/.config/omarchy/local-drop.json`,
+`~/.config/omarchy/local-drop-cert.pem`, `$XDG_RUNTIME_DIR/omarchy-local-drop/`,
+and your download directory.
+
 ## Install
 
 ```bash
