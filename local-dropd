@@ -33,6 +33,7 @@ PROTOCOL_VERSION = "2.1"
 ANNOUNCE_INTERVAL = 6.0
 DEVICE_TTL = 90.0
 ASK_TIMEOUT = 60.0
+SESSION_TIMEOUT = 300.0
 MAX_TRANSFERS = 10
 NOTIFY_GLYPH = "󰀂"
 
@@ -456,8 +457,13 @@ class Daemon:
                      if now - d.get("lastSeen", 0) > DEVICE_TTL]
             for fingerprint in stale:
                 del self.devices[fingerprint]
+            session = self.session
         if stale:
             self.publish()
+        # A sender that accepts the tokens and then never uploads used to leave
+        # a transfer sitting at "active" until the shell restarted.
+        if session and now - session.created > SESSION_TIMEOUT:
+            self.fail_receive(session, "sender never delivered the files")
 
     # -------------------------------------------------------------- receive
     def request_permission(self, peer, files):
@@ -896,8 +902,11 @@ def make_handler(daemon):
         protocol_version = "HTTP/1.1"
         server_version = "OmarchyLocalDrop/1.0"
 
-        def log_message(self, *_args):
-            pass
+        def log_message(self, fmt, *args):
+            # The default logger writes a line per request to stderr, which the
+            # shell's journal picks up. Kept, because without it a receive that
+            # never delivers a byte is completely opaque from this side.
+            log("%s %s" % (self.address_string(), fmt % args))
 
         # ------------------------------------------------------- primitives
         def route(self):
@@ -982,23 +991,25 @@ def make_handler(daemon):
 
             meta = session.files.get(file_id) or {}
             declared = int(meta.get("size") or 0)
+            chunked = "chunked" in (self.headers.get("Transfer-Encoding") or "").lower()
             length = int(self.headers.get("Content-Length") or 0)
-            if length <= 0 or (declared and length > declared + (1 << 20)):
+            # A phone streaming a photo does not know the length up front and
+            # frames the body as chunked. Refusing that was refusing the file.
+            if not chunked and length <= 0:
+                daemon.fail_receive(session, "sender supplied no body length")
+                return self.reply(400, {"message": "no body length"})
+            if not chunked and declared and length > declared + (1 << 20):
+                daemon.fail_receive(session, "body larger than the declared size")
                 return self.reply(400, {"message": "unexpected body size"})
 
             os.makedirs(daemon.save_dir, exist_ok=True)
             target = unique_path(daemon.save_dir, safe_name(meta.get("fileName")))
             partial = target + ".part"
-            written = 0
             try:
                 with open(partial, "wb") as handle:
-                    while written < length:
-                        chunk = self.rfile.read(min(256 * 1024, length - written))
-                        if not chunk:
-                            raise OSError("connection closed early")
-                        handle.write(chunk)
-                        written += len(chunk)
-                        self.report(session, file_id, written)
+                    written = (self.stream_chunked(handle, session, file_id, declared)
+                               if chunked
+                               else self.stream_sized(handle, session, file_id, length))
                 os.replace(partial, target)
             except OSError as exc:
                 try:
@@ -1013,6 +1024,49 @@ def make_handler(daemon):
             self.reply(200, {})
             if len(session.done) >= len(session.files):
                 daemon.finish_session(session)
+
+        def stream_sized(self, handle, session, file_id, length):
+            written = 0
+            while written < length:
+                chunk = self.rfile.read(min(256 * 1024, length - written))
+                if not chunk:
+                    raise OSError("connection closed early")
+                handle.write(chunk)
+                written += len(chunk)
+                self.report(session, file_id, written)
+            return written
+
+        def stream_chunked(self, handle, session, file_id, declared):
+            """Read an HTTP/1.1 chunked body, capped so a peer cannot fill the disk."""
+            ceiling = (declared + (1 << 20)) if declared else (8 << 30)
+            written = 0
+            while True:
+                header = self.rfile.readline(1024).strip()
+                if not header:
+                    raise OSError("truncated chunk header")
+                try:
+                    size = int(header.split(b";", 1)[0], 16)
+                except ValueError:
+                    raise OSError("malformed chunk header")
+                if size == 0:
+                    while True:  # trailers, then the closing blank line
+                        trailer = self.rfile.readline(1024)
+                        if trailer in (b"\r\n", b"\n", b""):
+                            break
+                    break
+                if written + size > ceiling:
+                    raise OSError("body larger than the declared size")
+                remaining = size
+                while remaining > 0:
+                    chunk = self.rfile.read(min(256 * 1024, remaining))
+                    if not chunk:
+                        raise OSError("connection closed mid-chunk")
+                    handle.write(chunk)
+                    written += len(chunk)
+                    remaining -= len(chunk)
+                    self.report(session, file_id, written)
+                self.rfile.read(2)  # CRLF after each chunk
+            return written
 
         def report(self, session, file_id, written, final=False):
             now = time.time()

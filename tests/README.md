@@ -29,7 +29,13 @@ LocalDrop talks to an encrypted peer.
 ```bash
 ./tests/send-to-us ~/Pictures/photo.png
 ./tests/send-to-us --alias "Pixel 8" a.txt b.txt
+./tests/send-to-us --chunked big.jpeg     # how a phone streams a photo
 ```
+
+`--chunked` frames the body with `Transfer-Encoding: chunked` and no
+`Content-Length`, which is what a phone streaming a photo out of its library
+does. Handling only `Content-Length` meant every real transfer from a phone
+was refused, so this flag is worth keeping in the loop.
 
 On `Ask first` this parks a request in the panel and blocks until you accept or
 decline it — the only way to exercise that path without a second device.

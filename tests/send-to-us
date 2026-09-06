@@ -25,6 +25,10 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=53317)
     parser.add_argument("--alias", default="Test sender")
+    parser.add_argument("--chunked", action="store_true",
+                        help="frame the body the way a phone streaming a photo "
+                             "does, with Transfer-Encoding: chunked and no "
+                             "Content-Length")
     args = parser.parse_args()
 
     paths = [os.path.abspath(p) for p in args.files]
@@ -65,16 +69,25 @@ def main():
         query = "?sessionId=%s&fileId=%s&token=%s" % (
             prepared["sessionId"], file_id, prepared["files"][file_id])
         conn = http.client.HTTPConnection(args.host, args.port, timeout=600)
-        conn.putrequest("POST", "/api/localsend/v2/upload" + query)
+        conn.putrequest("POST", "/api/localsend/v2/upload" + query,
+                        skip_accept_encoding=True)
         conn.putheader("Content-Type", "application/octet-stream")
-        conn.putheader("Content-Length", str(size))
+        if args.chunked:
+            conn.putheader("Transfer-Encoding", "chunked")
+        else:
+            conn.putheader("Content-Length", str(size))
         conn.endheaders()
         with open(path, "rb") as handle:
             while True:
                 chunk = handle.read(256 * 1024)
                 if not chunk:
                     break
-                conn.send(chunk)
+                if args.chunked:
+                    conn.send(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
+                else:
+                    conn.send(chunk)
+        if args.chunked:
+            conn.send(b"0\r\n\r\n")
         response = conn.getresponse()
         response.read()
         print("upload %-30s → HTTP %d" % (os.path.basename(path), response.status))
