@@ -159,8 +159,8 @@ install alongside it. Listed so you can check:
 
 The QML side needs Quickshell, which is what runs the Omarchy shell.
 
-No part of this plugin uses `sudo`, `pkexec`, or a systemd unit, and it writes
-only to `~/.config/omarchy/local-drop.json`,
+No sudo or pkexec is required. The plugin installs no systemd unit, and it
+writes only to `~/.config/omarchy/local-drop.json`,
 `~/.config/omarchy/local-drop-cert.pem`, `$XDG_RUNTIME_DIR/omarchy-local-drop/`,
 and your download directory.
 
