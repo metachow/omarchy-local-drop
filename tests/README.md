@@ -28,6 +28,30 @@ LocalDrop talks to an encrypted peer.
 hostile-peer case a marketplace security review raised. A send to a flooding
 peer must fail with a bounded error rather than growing the daemon's memory.
 
+### Reproducing the memory-exhaustion finding
+
+Run the daemon under a memory cap, in its own config and runtime directories,
+and let a flooding peer announce itself. Nothing else — no accept, no send:
+
+```bash
+mkdir -p /tmp/ld-test                     # short path: AF_UNIX has a 108-char limit
+./tests/fake-peer --flood --port 53399 &
+
+systemd-run --user --unit=ld-test -p MemoryMax=512M -p MemorySwapMax=0 \
+  --setenv=XDG_CONFIG_HOME=/tmp/ld-test/config --setenv=XDG_RUNTIME_DIR=/tmp/ld-test \
+  ./local-dropd                           # give it port 53318 in its config
+
+python3 -c 'import json,socket; socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(
+  json.dumps({"alias":"Hostile","version":"2.1","deviceType":"mobile",
+              "fingerprint":"dead"*16,"port":53399,"protocol":"http",
+              "announce":True}).encode(), ("127.0.0.1", 53318))'
+```
+
+Answering an announcement is enough, because the daemon registers itself back
+with any device that announces. Before the response-body ceiling that path went
+from 26 MB to the 512 MB cap in under a second and was OOM-killed; with it, RSS
+holds at 26 MB through 45 seconds of repeated hostile announcements.
+
 ## A device to receive from
 
 ```bash
