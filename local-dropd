@@ -33,6 +33,12 @@ PROTOCOL_VERSION = "2.1"
 ANNOUNCE_INTERVAL = 6.0
 DEVICE_TTL = 90.0
 ASK_TIMEOUT = 60.0
+# Ceiling on a peer's response body. A prepare-upload answer is a few hundred
+# bytes; nothing a peer legitimately sends us comes close to this.
+MAX_RESPONSE_BYTES = 1 << 20
+# A chunked body ends with optional trailers; more than a handful is a peer
+# holding the connection open rather than finishing.
+MAX_TRAILER_LINES = 32
 STALL_TIMEOUT = 60.0
 MAX_TRANSFERS = 10
 NOTIFY_GLYPH = "󰀂"
@@ -69,6 +75,21 @@ CLIPBOARD_TYPES = [
 
 def log(*parts):
     print("[local-dropd]", *parts, file=sys.stderr, flush=True)
+
+
+def read_response(response, limit=MAX_RESPONSE_BYTES):
+    """Read a peer's response body with a hard ceiling.
+
+    `http.client`'s `read()` with no argument buffers until EOF, so a device on
+    the local network could answer any of our requests with an endless body and
+    exhaust this process's memory. Every answer we care about is a few hundred
+    bytes of JSON, so anything past the ceiling is treated as a bad answer
+    rather than a truncated good one, and the caller closes the connection.
+    """
+    body = response.read(limit + 1)
+    if len(body) > limit:
+        raise ValueError("peer answered with more than %d bytes" % limit)
+    return body
 
 
 def clean_text(value, limit=200):
@@ -420,9 +441,11 @@ class Daemon:
             conn.request("POST", "/api/localsend/v2/register",
                          body=json.dumps(self.info()).encode("utf-8"),
                          headers={"Content-Type": "application/json"})
-            conn.getresponse().read()
-            conn.close()
-        except (OSError, http.client.HTTPException):
+            try:
+                read_response(conn.getresponse())
+            finally:
+                conn.close()
+        except (OSError, ValueError, http.client.HTTPException):
             pass
 
     def discovery_loop(self):
@@ -730,10 +753,12 @@ class Daemon:
             conn.request("POST", "/api/localsend/v2/prepare-upload", body=body,
                          headers={"Content-Type": "application/json"})
             response = conn.getresponse()
-            raw = response.read()
-            status = response.status
-            conn.close()
-        except (OSError, http.client.HTTPException) as exc:
+            try:
+                raw = read_response(response)
+                status = response.status
+            finally:
+                conn.close()
+        except (OSError, ValueError, http.client.HTTPException) as exc:
             return fail("could not reach %s (%s)" % (device.get("alias", "device"), exc))
 
         if status == 403:
@@ -784,10 +809,12 @@ class Daemon:
                             transfer["updated"] = last
                             self.track(transfer)
                 response = conn.getresponse()
-                response.read()
-                code = response.status
-                conn.close()
-            except (OSError, http.client.HTTPException) as exc:
+                try:
+                    read_response(response)
+                    code = response.status
+                finally:
+                    conn.close()
+            except (OSError, ValueError, http.client.HTTPException) as exc:
                 return fail("upload interrupted (%s)" % exc)
             if code not in (200, 204):
                 return fail("%s refused %s (HTTP %d)" % (
@@ -1129,10 +1156,15 @@ def make_handler(daemon):
                 except ValueError:
                     raise OSError("malformed chunk header")
                 if size == 0:
-                    while True:  # trailers, then the closing blank line
+                    # Trailers, then the closing blank line. Bounded: a peer
+                    # sending an endless run of trailer lines would otherwise
+                    # hold this thread in the loop forever.
+                    for _ in range(MAX_TRAILER_LINES):
                         trailer = self.rfile.readline(1024)
                         if trailer in (b"\r\n", b"\n", b""):
                             break
+                    else:
+                        raise OSError("too many trailer lines")
                     break
                 if written + size > ceiling:
                     raise OSError("body larger than the declared size")

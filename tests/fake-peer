@@ -54,6 +54,26 @@ def make_handler(inbox):
         def log_message(self, *_args):
             pass
 
+        def flood(self):
+            """Stream an endless response body until the client gives up.
+
+            The reason every peer answer is read with a ceiling: without one,
+            this exhausts the plugin's memory.
+            """
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            block = b"A" * 65536
+            sent = 0
+            try:
+                while sent < (1 << 30):
+                    self.wfile.write(b"%x\r\n" % len(block) + block + b"\r\n")
+                    sent += len(block)
+            except OSError:
+                pass
+            print("→ client stopped reading after %d bytes" % sent, flush=True)
+
         def reply(self, code, payload=None):
             body = b"" if payload is None else json.dumps(payload).encode("utf-8")
             self.send_response(code)
@@ -70,6 +90,11 @@ def make_handler(inbox):
                              "protocol": ARGS.protocol, "download": False})
 
         def do_POST(self):
+            if ARGS.flood:
+                length = int(self.headers.get("Content-Length") or 0)
+                if length:
+                    self.rfile.read(length)
+                return self.flood()
             route = urlparse(self.path)
             query = parse_qs(route.query)
             length = int(self.headers.get("Content-Length") or 0)
@@ -137,6 +162,9 @@ def main():
     parser.add_argument("--mtls", action="store_true",
                         help="serve HTTPS and require a client certificate")
     parser.add_argument("--alias", default="Fake peer")
+    parser.add_argument("--flood", action="store_true",
+                        help="answer every request with an endless response "
+                             "body, the way a hostile device would")
     parser.add_argument("--device-type", default="mobile")
     parser.add_argument("--port", type=int, default=53399)
     # Not inside the plugin directory: the shell watches that tree and reloads

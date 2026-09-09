@@ -24,6 +24,10 @@ away with `TLSV13_ALERT_CERTIFICATE_REQUIRED`. It needs
 `~/.config/omarchy/local-drop-cert.pem` to exist, which happens the first time
 LocalDrop talks to an encrypted peer.
 
+`--flood` makes it answer every request with an endless response body — the
+hostile-peer case a marketplace security review raised. A send to a flooding
+peer must fail with a bounded error rather than growing the daemon's memory.
+
 ## A device to receive from
 
 ```bash
