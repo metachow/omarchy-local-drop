@@ -39,6 +39,12 @@ MAX_RESPONSE_BYTES = 1 << 20
 # A chunked body ends with optional trailers; more than a handful is a peer
 # holding the connection open rather than finishing.
 MAX_TRAILER_LINES = 32
+# Anyone on the network can announce themselves, so the table they land in is
+# bounded and evicts whoever was heard from longest ago.
+MAX_DEVICES = 64
+# One transfer's worth of files, and the free space to keep underneath it.
+MAX_FILES_PER_SESSION = 512
+DISK_MARGIN = 256 << 20
 STALL_TIMEOUT = 60.0
 MAX_TRANSFERS = 10
 NOTIFY_GLYPH = "󰀂"
@@ -210,9 +216,10 @@ class Config:
 class Session:
     """One accepted incoming transfer, alive until every file has landed."""
 
-    def __init__(self, session_id, peer, files):
+    def __init__(self, session_id, peer, files, ip=""):
         self.id = session_id
         self.peer = peer
+        self.ip = ip
         self.files = files            # file_id -> metadata dict
         self.tokens = {}              # file_id -> token
         self.done = set()
@@ -312,16 +319,34 @@ class Daemon:
         self.publish()
 
     def remember(self, payload, ip, source="udp"):
-        fingerprint = str(payload.get("fingerprint") or "")
+        """Record a peer. Returns (device, changed); never raises on junk.
+
+        Everything here is attacker-supplied: one announcement with a
+        non-numeric port used to raise straight out of the discovery loop and
+        kill that thread for the life of the process, which left the panel
+        frozen on whatever it had already seen.
+        """
+        fingerprint = str(payload.get("fingerprint") or "")[:128]
         if not fingerprint or fingerprint == self.fingerprint:
-            return None
+            return None, False
+        try:
+            port = int(payload.get("port") or DEFAULT_PORT)
+        except (TypeError, ValueError):
+            port = DEFAULT_PORT
+        if not (0 < port < 65536):
+            port = DEFAULT_PORT
         with self.lock:
+            if fingerprint not in self.devices and len(self.devices) >= MAX_DEVICES:
+                oldest = min(self.devices, key=lambda f: self.devices[f].get("lastSeen", 0))
+                del self.devices[oldest]
             device = self.devices.get(fingerprint, {})
+            before = {k: device.get(k) for k in ("alias", "ip", "port", "deviceType",
+                                                 "deviceModel", "protocol")}
             device.update({
                 "fingerprint": fingerprint,
                 "alias": str(payload.get("alias") or "Unknown device")[:64],
                 "ip": ip,
-                "port": int(payload.get("port") or DEFAULT_PORT),
+                "port": port,
                 "deviceType": str(payload.get("deviceType") or "desktop"),
                 "deviceModel": str(payload.get("deviceModel") or ""),
                 "protocol": "https" if payload.get("protocol") == "https" else "http",
@@ -329,7 +354,10 @@ class Daemon:
                 "source": source,
             })
             self.devices[fingerprint] = device
-        return device
+            changed = any(device.get(k) != before.get(k) for k in before)
+        # Publishing on every packet let a flood of announcements turn into a
+        # rewrite of the whole state file per packet; only real changes count.
+        return device, changed
 
     # ------------------------------------------------------------ discovery
     def open_udp(self):
@@ -461,14 +489,19 @@ class Daemon:
                 continue
             try:
                 payload = json.loads(data.decode("utf-8"))
-            except (ValueError, UnicodeDecodeError):
+            except Exception:                   # malformed, huge, deeply nested…
                 continue
             if not isinstance(payload, dict):
                 continue
-            device = self.remember(payload, addr[0])
+            try:
+                device, changed = self.remember(payload, addr[0])
+            except Exception as exc:            # never let one packet end the loop
+                log("ignoring an unusable announcement: %s" % exc)
+                continue
             if device is None:
                 continue
-            self.publish()
+            if changed:
+                self.publish()
             if payload.get("announce"):
                 self.send_announcement(announce=False, unicast=(addr[0], device["port"]))
                 threading.Thread(target=self.register_with, args=(device,),
@@ -563,8 +596,8 @@ class Daemon:
         self.incoming_event.set()
         return "ok"
 
-    def start_session(self, peer, files):
-        session = Session(uuid.uuid4().hex, peer, files)
+    def start_session(self, peer, files, ip=""):
+        session = Session(uuid.uuid4().hex, peer, files, ip)
         for file_id in files:
             session.tokens[file_id] = uuid.uuid4().hex
         with self.lock:
@@ -1048,13 +1081,18 @@ def make_handler(daemon):
             if path == "/upload":
                 return self.handle_upload(query)
             if path == "/cancel":
-                return self.handle_cancel()
+                return self.handle_cancel(query)
             self.reply(404, {"message": "not found"})
 
         def handle_register(self):
             payload = self.read_json() or {}
             if isinstance(payload, dict):
-                if daemon.remember(payload, self.client_address[0], source="http"):
+                try:
+                    device, changed = daemon.remember(payload, self.client_address[0],
+                                                      source="http")
+                except Exception:
+                    device, changed = None, False
+                if device is not None and changed:
                     daemon.publish()
             self.reply(200, daemon.info())
 
@@ -1067,15 +1105,36 @@ def make_handler(daemon):
             files = payload.get("files")
             if not isinstance(files, dict) or not files:
                 return self.reply(400, {"message": "no files"})
+            if len(files) > MAX_FILES_PER_SESSION:
+                return self.reply(400, {"message": "too many files"})
+            if not all(isinstance(f, dict) for f in files.values()):
+                return self.reply(400, {"message": "malformed file list"})
+            try:
+                declared = sum(max(0, int(f.get("size") or 0)) for f in files.values())
+            except (TypeError, ValueError):
+                return self.reply(400, {"message": "malformed file size"})
+            # "Everyone" mode accepts without asking, so nothing else would stop
+            # a peer from filling the disk. Leave a margin rather than running
+            # the filesystem to zero.
+            try:
+                free = shutil.disk_usage(daemon.save_dir).free
+            except OSError:
+                free = None
+            if free is not None and declared + DISK_MARGIN > free:
+                log("refusing %d bytes: only %d free" % (declared, free))
+                return self.reply(507, {"message": "not enough space"})
             peer = payload.get("info") if isinstance(payload.get("info"), dict) else {}
-            daemon.remember(peer, self.client_address[0], source="http")
+            try:
+                daemon.remember(peer, self.client_address[0], source="http")
+            except Exception:
+                pass
             with daemon.lock:
                 busy = daemon.session is not None
             if busy:
                 return self.reply(409, {"message": "already receiving"})
             if not daemon.request_permission(peer, files):
                 return self.reply(403, {"message": "declined"})
-            session = daemon.start_session(peer, files)
+            session = daemon.start_session(peer, files, self.client_address[0])
             self.reply(200, {"sessionId": session.id, "files": session.tokens})
 
         def handle_upload(self, query):
@@ -1088,6 +1147,10 @@ def make_handler(daemon):
                 return self.reply(403, {"message": "unknown session"})
             if session.tokens.get(file_id) != token or not token:
                 return self.reply(403, {"message": "bad token"})
+            # Tokens travel in the clear to an http peer, so being on the wire
+            # should not be enough to write into somebody else's session.
+            if session.ip and session.ip != self.client_address[0]:
+                return self.reply(403, {"message": "not your session"})
 
             meta = session.files.get(file_id) or {}
             declared = int(meta.get("size") or 0)
@@ -1196,12 +1259,22 @@ def make_handler(daemon):
                     transfer["updated"] = now
             daemon.publish()
 
-        def handle_cancel(self):
+        def handle_cancel(self, query):
+            """Cancel the session named in the request — and only that one.
+
+            This used to drop whatever transfer was running, for anybody who
+            asked, with no session id and no token: one empty POST from any
+            device on the network killed a transfer you had just accepted.
+            """
+            session_id = (query.get("sessionId") or [""])[0]
             with daemon.lock:
                 session = daemon.session
+                if not session or not session_id or session.id != session_id:
+                    return self.reply(403, {"message": "unknown session"})
+                if session.ip and session.ip != self.client_address[0]:
+                    return self.reply(403, {"message": "not your session"})
                 daemon.session = None
-            if session:
-                daemon.fail_receive(session, "cancelled by sender")
+            daemon.fail_receive(session, "cancelled by sender")
             self.reply(200, {})
 
     return Handler

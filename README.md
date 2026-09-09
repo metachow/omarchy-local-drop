@@ -94,6 +94,12 @@ omarchy-shell io.github.metachow.local-drop clipboard <fingerprint>
   on every outgoing connection; peer certificates are accepted without
   verification, which is what every LocalSend client does. This machine
   announces `http`, so peers reach it in the clear.
+- Anything on the local network can talk to the receive server, so it treats
+  every field as hostile: a session can only be cancelled by the device that
+  opened it and only by naming its id, uploads are refused from any other
+  address, the device table is capped and evicts the stalest entry, a transfer
+  larger than the free space is refused outright, and no malformed packet can
+  take down the discovery loop.
 - Transfers are plain HTTP on the local network, like LocalSend's own default.
   `Ask first` is what keeps a stranger on the same café Wi-Fi from writing to
   your disk — leave it on there, or switch receiving off.
